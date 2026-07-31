@@ -28,3 +28,11 @@ bvh = ["std"]
 serde = ["dep:serde", "serde/alloc", "glam/serde"]
 bytemuck = ["dep:bytemuck", "glam/bytemuck"]
 approx = ["dep:approx", "glam/approx"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+rand = "0.9"
+
+[[bench]]
+name = "ray"
+harness = false
