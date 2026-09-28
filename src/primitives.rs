@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 use core::f32::consts::{PI, TAU};
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -431,6 +431,84 @@ pub fn tet_grid(cells: [usize; 3], size: Vec3) -> TetMesh {
         for j in 0..ny {
             for i in 0..nx {
                 kuhn_cell((i, j, k), id, &mut tets);
+            }
+        }
+    }
+    TetMesh::new(vertices, tets)
+}
+
+/// A rectilinear box grid through the given node coordinates along each axis, each cell
+/// Kuhn-split into six tetrahedra. Unlike [`tet_grid`] the spacing is arbitrary, so a mesh can be
+/// graded (fine where a field is steep, coarse elsewhere) while staying conforming.
+///
+/// # Panics
+/// Panics if an axis has fewer than two coordinates or is not strictly ascending.
+#[must_use]
+pub fn tet_grid_axes(xs: &[f32], ys: &[f32], zs: &[f32]) -> TetMesh {
+    for axis in [xs, ys, zs] {
+        assert!(axis.len() >= 2, "each axis needs at least two coordinates");
+        assert!(axis.windows(2).all(|w| w[1] > w[0]), "axis coordinates must strictly ascend");
+    }
+    let (nx, ny, nz) = (xs.len() - 1, ys.len() - 1, zs.len() - 1);
+    let id = |i: usize, j: usize, k: usize| ((k * (ny + 1) + j) * (nx + 1) + i) as u32;
+
+    let mut vertices = Vec::with_capacity(xs.len() * ys.len() * zs.len());
+    for &z in zs {
+        for &y in ys {
+            for &x in xs {
+                vertices.push(Vec3::new(x, y, z));
+            }
+        }
+    }
+    let mut tets = Vec::with_capacity(nx * ny * nz * 6);
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                kuhn_cell((i, j, k), id, &mut tets);
+            }
+        }
+    }
+    TetMesh::new(vertices, tets)
+}
+
+/// Sweeps a planar triangulated cross-section along `+X` through `stations`, splitting each
+/// triangular prism into three tetrahedra. Section point `(u, v)` lands at `(x, u, v)`.
+///
+/// Every quad side face is split along the diagonal that runs from its lower-indexed section
+/// vertex on the near station to its higher-indexed one on the far station, a rule that depends
+/// only on the shared edge, so neighbouring prisms always agree and the mesh is conforming.
+/// Vertex `v` of station `s` has index `s * section.len() + v`.
+///
+/// # Panics
+/// Panics if fewer than two stations are given or they are not strictly ascending.
+#[must_use]
+pub fn extrude_section(section: &[Vec2], triangles: &[[u32; 3]], stations: &[f32]) -> TetMesh {
+    assert!(stations.len() >= 2, "an extrusion needs at least two stations");
+    assert!(stations.windows(2).all(|w| w[1] > w[0]), "stations must strictly ascend");
+    let nv = section.len() as u32;
+    let mut vertices = Vec::with_capacity(section.len() * stations.len());
+    for &x in stations {
+        for p in section {
+            vertices.push(Vec3::new(x, p.x, p.y));
+        }
+    }
+    let mut tets = Vec::with_capacity(triangles.len() * (stations.len() - 1) * 3);
+    for s in 0..stations.len() as u32 - 1 {
+        let (near, far) = (s * nv, (s + 1) * nv);
+        for tri in triangles {
+            let mut t = *tri;
+            t.sort_unstable();
+            let [a, b, c] = t;
+            for mut tet in [
+                [near + a, near + b, near + c, far + c],
+                [near + a, near + b, far + b, far + c],
+                [near + a, far + a, far + b, far + c],
+            ] {
+                let [p0, p1, p2, p3] = tet.map(|v| vertices[v as usize]);
+                if (p1 - p0).cross(p2 - p0).dot(p3 - p0) < 0.0 {
+                    tet.swap(2, 3);
+                }
+                tets.push(tet);
             }
         }
     }

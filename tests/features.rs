@@ -118,6 +118,39 @@ fn tet_grid_volume_and_orientation() {
 }
 
 #[test]
+fn tet_grid_axes_is_graded_and_conforming() {
+    let xs = [0.0, 0.01, 0.03, 0.07, 0.15];
+    let ys = [-0.05, -0.01, 0.0, 0.01, 0.05];
+    let zs = [0.0, 0.002, 0.006];
+    let mesh = primitives::tet_grid_axes(&xs, &ys, &zs);
+    assert!(mesh.is_valid());
+    assert_eq!(mesh.tet_count(), 4 * 4 * 2 * 6);
+    assert!((mesh.volume() - 0.15 * 0.1 * 0.006).abs() < 1e-8);
+    assert!(mesh.signed_volumes().iter().all(|&v| v > 0.0));
+    assert!(mesh.surface().is_watertight());
+}
+
+#[test]
+fn extrude_section_is_conforming_for_any_triangulation() {
+    // A right-triangle section fanned from a centre vertex, so neighbouring triangles share
+    // edges with vertex indices in every relative order.
+    let section = [
+        glam::Vec2::new(0.0, 0.0),
+        glam::Vec2::new(0.006, 0.0),
+        glam::Vec2::new(0.0, 0.006),
+        glam::Vec2::new(0.002, 0.002),
+    ];
+    let triangles = [[3, 0, 1], [1, 2, 3], [2, 0, 3]];
+    let stations = [0.0, 0.01, 0.025, 0.05];
+    let mesh = primitives::extrude_section(&section, &triangles, &stations);
+    assert!(mesh.is_valid());
+    assert_eq!(mesh.tet_count(), 3 * 3 * 3);
+    assert!(mesh.signed_volumes().iter().all(|&v| v > 0.0));
+    assert!((mesh.volume() - 0.5 * 0.006 * 0.006 * 0.05).abs() < 1e-10);
+    assert!(mesh.surface().is_watertight(), "prism split left a crack between neighbours");
+}
+
+#[test]
 fn tetrahedralize_grid_fills_a_sphere() {
     let surface = primitives::icosphere(1.0, 2);
     let mesh = primitives::tetrahedralize_grid(&surface, 0.25);
