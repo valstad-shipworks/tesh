@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng};
 
 use std::hint::black_box;
 
-use tesh::primitives::{icosphere, torus};
+use tesh::primitives::{icosphere, tet_grid, torus};
 use tesh::{Mesh, TriMesh};
 
 const N_RAYS: usize = 256;
@@ -119,5 +119,44 @@ fn bench_small(c: &mut Criterion) {
     bench_set(c, "icosphere320", &mesh, 4.0);
 }
 
-criterion_group!(ray_benches, bench_icosphere, bench_torus, bench_small);
+fn bench_tet(c: &mut Criterion) {
+    let mesh = tet_grid([40, 40, 40], Vec3::splat(2.0));
+    let mut rng = SmallRng::seed_from_u64(0x7E7);
+    let hit = inward_rays(&mut rng, 4.0);
+    let scattered = scattered_rays(&mut rng, 4.0);
+    let _ = mesh.ray_intersect(Vec3::splat(-4.0), Vec3::ONE.normalize());
+
+    for (name, rays) in [("hit", &hit), ("scattered", &scattered)] {
+        c.bench_function(&format!("ray_tetgrid384k_{name}"), |b| {
+            b.iter(|| {
+                let mut acc = 0.0f32;
+                for &(origin, dir) in rays {
+                    if let Some(h) = mesh.ray_intersect(black_box(origin), black_box(dir)) {
+                        acc += h.t + h.tet as f32;
+                    }
+                }
+                acc
+            })
+        });
+    }
+
+    let mut group = c.benchmark_group("tet_boundary");
+    group.sample_size(10);
+    group.bench_function("first_ray_tetgrid384k", |b| {
+        b.iter_batched(
+            || mesh.clone(),
+            |m| m.ray_intersect(Vec3::splat(-4.0), Vec3::ONE.normalize()),
+            criterion::BatchSize::LargeInput,
+        )
+    });
+    group.finish();
+}
+
+criterion_group!(
+    ray_benches,
+    bench_icosphere,
+    bench_torus,
+    bench_small,
+    bench_tet
+);
 criterion_main!(ray_benches);

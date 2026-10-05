@@ -109,10 +109,7 @@ impl Kernel<f32> for Locate<'_> {
                     continue;
                 }
             }
-            match stack.pop() {
-                Some(n) => ni = n,
-                None => return None,
-            }
+            ni = stack.pop()?;
         }
     }
 }

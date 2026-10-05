@@ -9,6 +9,7 @@ use hydroplane::{
 use crate::aabb::Aabb;
 use crate::accel::TraversalStack;
 use crate::accel::bvh2::{Bvh2, Node};
+use crate::accel::bvh4::{self, Node4, Ray4, SLAB_EXIT_SCALE};
 use crate::tri::{RayHit, TriMesh};
 use crate::triangle;
 
@@ -32,6 +33,8 @@ const COLUMN_PAD: usize = hydroplane::MAX_LANES;
 /// to the mesh the tree was built from.
 pub struct TriBvh {
     bvh: Bvh2,
+    /// The same tree collapsed to 4-wide nodes, for ray traversal.
+    nodes4: Vec<Node4>,
     /// Corner components in leaf-slot order, one column per `(corner, axis)`:
     /// `ax ay az bx by bz cx cy cz`. Slot order keeps each leaf's lanes contiguous.
     corners: [Vec<f32>; 9],
@@ -44,7 +47,7 @@ fn ray_aabb(node: &Node, origin: Vec3A, inv_dir: Vec3A, tmax: f32) -> f32 {
     let t1 = (node.min - origin) * inv_dir;
     let t2 = (node.max - origin) * inv_dir;
     let t_near = t1.min(t2).max_element().max(0.0);
-    let t_far = t1.max(t2).min_element().min(tmax);
+    let t_far = (t1.max(t2).min_element() * SLAB_EXIT_SCALE).min(tmax);
     if t_near <= t_far { t_near } else { f32::INFINITY }
 }
 
@@ -77,7 +80,12 @@ impl TriBvh {
             let last = col.last().copied().unwrap_or(0.0);
             col.resize(col.len() + COLUMN_PAD, last);
         }
-        Self { bvh, corners }
+        let nodes4 = bvh4::collapse(&bvh);
+        Self {
+            bvh,
+            nodes4,
+            corners,
+        }
     }
 
     /// The triangle behind BVH primitive slot `slot`.
@@ -94,13 +102,20 @@ impl TriBvh {
     /// Nearest intersection of the ray `origin + t * dir` (`t >= 0`) with the surface.
     #[must_use]
     pub fn ray_intersect(&self, origin: Vec3, dir: Vec3) -> Option<RayHit> {
-        if self.bvh.nodes.is_empty() {
+        let inv_dir = bvh4::safe_inv_dir(dir);
+        if !self
+            .bvh
+            .nodes
+            .first()
+            .is_some_and(|root| bvh4::hits_node(root, origin, inv_dir))
+        {
             return None;
         }
         dispatch(RayQuery {
             tree: self,
             origin,
             dir,
+            inv_dir,
         })
         .map(|(slot, t)| RayHit {
             face: self.bvh.prim_indices[slot],
@@ -242,6 +257,7 @@ struct RayQuery<'a> {
     tree: &'a TriBvh,
     origin: Vec3,
     dir: Vec3,
+    inv_dir: Vec3,
 }
 
 impl Kernel<f32> for RayQuery<'_> {
@@ -249,55 +265,111 @@ impl Kernel<f32> for RayQuery<'_> {
     type Output = Option<(usize, f32)>;
 
     fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> Self::Output {
-        let nodes = &self.tree.bvh.nodes;
-        let origin_a = Vec3A::from(self.origin);
-        let inv_dir = Vec3A::from(self.dir).recip();
+        let nodes = &self.tree.nodes4;
+        let ray = Ray4::new(self.origin, self.inv_dir);
         let ow = g.splat_vec3(self.origin);
         let dw = g.splat_vec3(self.dir);
 
         let mut best_t = f32::INFINITY;
         let mut best_slot = usize::MAX;
-        if ray_aabb(&nodes[0], origin_a, inv_dir, best_t).is_infinite() {
-            return None;
-        }
-        let lanes = g.lanes::<f32>();
         let mut stack: TraversalStack<(u32, f32)> = TraversalStack::new();
         let mut ni = 0u32;
-        'traverse: loop {
+        loop {
             let node = &nodes[ni as usize];
-            if node.is_leaf() {
-                let start = node.first as usize;
-                let len = node.count as usize;
-                let cols = self.tree.leaf_cols(start, len, lanes);
-                for off in (0..cols[0].len()).step_by(lanes) {
-                    let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
-                    let (t, _) = ray_tri_wide(g, ow, dw, v);
-                    take_nearest(g, t, start + off, &mut best_t, &mut best_slot);
-                }
-            } else {
-                let l = node.first;
-                let tl = ray_aabb(&nodes[l as usize], origin_a, inv_dir, best_t);
-                let tr = ray_aabb(&nodes[l as usize + 1], origin_a, inv_dir, best_t);
-                // Descend into the nearer hit child, deferring the farther one.
-                let (near, far) = if tl <= tr { (l, l + 1) } else { (l + 1, l) };
-                let (t_near, t_far) = if tl <= tr { (tl, tr) } else { (tr, tl) };
-                if t_near.is_finite() {
-                    if t_far.is_finite() {
-                        stack.push((far, t_far));
+            let t = ray.hit_children(node, best_t);
+
+            // Hit children as (child, count, entry t), nearest first.
+            let mut order = [(0u32, 0u32, 0.0f32); 4];
+            let mut hits = 0;
+            for (lane, &entry) in t.iter().enumerate() {
+                if entry < best_t {
+                    let mut p = hits;
+                    while p > 0 && order[p - 1].2 > entry {
+                        order[p] = order[p - 1];
+                        p -= 1;
                     }
-                    ni = near;
-                    continue;
+                    order[p] = (node.child[lane], node.count[lane], entry);
+                    hits += 1;
                 }
             }
-            while let Some((n, t)) = stack.pop() {
-                if t < best_t {
-                    ni = n;
-                    continue 'traverse;
+
+            // Leaves first, nearest first: each hit tightens `best_t` for every box after it.
+            for &(first, count, entry) in &order[..hits] {
+                if count > 0 && entry < best_t {
+                    let (start, len) = (first as usize, count as usize);
+                    ray_leaf(g, self.tree, ow, dw, start, len, &mut best_t, &mut best_slot);
                 }
             }
-            break;
+
+            // Descend into the nearest internal child, deferring the rest farthest-first.
+            let mut next = None;
+            for &(child, count, entry) in order[..hits].iter().rev() {
+                if count == 0
+                    && entry < best_t
+                    && let Some(deferred) = next.replace((child, entry))
+                {
+                    stack.push(deferred);
+                }
+            }
+            if let Some((child, _)) = next {
+                ni = child;
+                continue;
+            }
+            loop {
+                match stack.pop() {
+                    Some((child, entry)) if entry < best_t => {
+                        ni = child;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => return (best_slot != usize::MAX).then_some((best_slot, best_t)),
+                }
+            }
         }
-        (best_slot != usize::MAX).then_some((best_slot, best_t))
+    }
+}
+
+/// Tests one leaf's triangles and folds the nearest into the running best. The chunk minima
+/// are combined lane-wise and reduced once per leaf, keeping the horizontal reduction off the
+/// per-chunk critical path; the winning lane is recovered only when the leaf improves on
+/// `best_t`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn ray_leaf<S: Backend<f32>>(
+    g: Gang<S>,
+    tree: &TriBvh,
+    origin: Vec3Wide<S>,
+    dir: Vec3Wide<S>,
+    start: usize,
+    len: usize,
+    best_t: &mut f32,
+    best_slot: &mut usize,
+) {
+    let lanes = g.lanes::<f32>();
+    let cols = tree.leaf_cols(start, len, lanes);
+    let chunks = cols[0].len() / lanes;
+    let inf = g.splat(f32::INFINITY);
+    let mut chunk_t = [inf; MAX_LEAF as usize];
+    let mut leaf_min = inf;
+    for (ci, slot) in chunk_t.iter_mut().enumerate().take(chunks) {
+        let off = ci * lanes;
+        let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
+        let (t, _) = ray_tri_wide(g, origin, dir, v);
+        *slot = t;
+        leaf_min = leaf_min.min(t);
+    }
+    let leaf_t = leaf_min.reduce_min();
+    if leaf_t < *best_t {
+        *best_t = leaf_t;
+        let m = g.splat(leaf_t);
+        // The first chunk holding the minimum, lowest lane on a tie, as a forward scan would.
+        for (ci, t) in chunk_t[..chunks].iter().enumerate() {
+            let bits = t.le(m).to_bitmask();
+            if bits != 0 {
+                *best_slot = start + ci * lanes + bits.trailing_zeros() as usize;
+                break;
+            }
+        }
     }
 }
 

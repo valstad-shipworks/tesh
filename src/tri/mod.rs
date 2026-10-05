@@ -64,7 +64,7 @@ impl TriMesh {
         );
         Self::new(
             positions.iter().map(|&p| Vec3::from_array(p)).collect(),
-            indices.chunks_exact(3).map(|f| [f[0], f[1], f[2]]).collect(),
+            indices.as_chunks::<3>().0.to_vec(),
         )
     }
 

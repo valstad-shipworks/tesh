@@ -29,7 +29,7 @@ pub mod triangle;
 
 pub use aabb::Aabb;
 pub use mass::MassProperties;
-pub use tet::{BoundaryFace, TetMesh};
+pub use tet::{BoundaryFace, TetMesh, TetRayHit};
 pub use traits::{Bounds, Mesh, Transform};
 pub use tri::{Components, RayHit, SurfaceHit, TriMesh};
 
@@ -43,7 +43,7 @@ pub(crate) mod sealed {
 pub mod prelude {
     pub use crate::aabb::Aabb;
     pub use crate::mass::MassProperties;
-    pub use crate::tet::{BoundaryFace, TetMesh};
+    pub use crate::tet::{BoundaryFace, TetMesh, TetRayHit};
     pub use crate::traits::{Bounds, Mesh, Transform};
     pub use crate::tri::{Components, RayHit, SurfaceHit, TriMesh};
 }

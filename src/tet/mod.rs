@@ -12,6 +12,8 @@ mod geometry;
 mod query;
 mod topology;
 
+pub use query::TetRayHit;
+
 /// The four faces of a tetrahedron `[a, b, c, d]`, each as (triangle, opposite apex).
 const TET_FACES: [([usize; 3], usize); 4] = [
     ([1, 2, 3], 0),
@@ -28,6 +30,14 @@ pub struct BoundaryFace {
     pub nodes: [u32; 3],
     pub area: f32,
     pub normal: Vec3,
+}
+
+/// The boundary of a [`TetMesh`] as a [`TriMesh`] over the volume's vertex buffer, with
+/// `owners[f] = 4 * tet + local face` for each surface face `f`.
+#[cfg(feature = "bvh")]
+pub(crate) struct BoundarySurface {
+    pub(crate) mesh: TriMesh,
+    pub(crate) owners: Vec<u32>,
 }
 
 /// An indexed tetrahedral mesh: a shared vertex buffer plus tetrahedra referencing it by
@@ -140,20 +150,79 @@ impl TetMesh {
     /// vertex buffer, so they line up with the tetrahedra.
     #[must_use]
     pub fn boundary_faces(&self) -> Vec<[u32; 3]> {
-        let mut seen: BTreeMap<[u32; 3], (u32, [u32; 3], u32)> = BTreeMap::new();
+        self.boundary_with_owners()
+            .into_iter()
+            .map(|(tri, _)| tri)
+            .collect()
+    }
+
+    /// Every boundary face as `(outward-wound triangle, 4 * tet + local face)`, where local
+    /// face `l` is the one opposite corner `l`. Ordered by the face's sorted vertex triple.
+    ///
+    /// Faces are bucketed by their smallest vertex index (a counting sort), so only the
+    /// handful of faces around each vertex are ever compared: linear in the element count.
+    pub(crate) fn boundary_with_owners(&self) -> Vec<([u32; 3], u32)> {
+        debug_assert!(
+            self.tets.len() < 1 << 30,
+            "tet count overflows the owner code"
+        );
+        let n = self.vertices.len();
+        let sorted_key = |tet: &[u32; 4], idx: [usize; 3]| {
+            let [mut a, mut b, mut c] = idx.map(|i| tet[i]);
+            if a > b {
+                core::mem::swap(&mut a, &mut b);
+            }
+            if b > c {
+                core::mem::swap(&mut b, &mut c);
+            }
+            if a > b {
+                core::mem::swap(&mut a, &mut b);
+            }
+            [a, b, c]
+        };
+
+        let mut start = alloc::vec![0u32; n + 1];
         for tet in &self.tets {
-            for (idx, apex) in TET_FACES {
-                let tri = [tet[idx[0]], tet[idx[1]], tet[idx[2]]];
-                let mut key = tri;
-                key.sort_unstable();
-                let entry = seen.entry(key).or_insert((0, tri, tet[apex]));
-                entry.0 += 1;
+            for (idx, _) in TET_FACES {
+                start[sorted_key(tet, idx)[0] as usize + 1] += 1;
             }
         }
-        seen.into_values()
-            .filter(|(count, ..)| *count == 1)
-            .map(|(_, tri, apex)| self.orient_outward(tri, apex))
-            .collect()
+        for i in 0..n {
+            start[i + 1] += start[i];
+        }
+
+        let mut fill = start.clone();
+        let mut slots = alloc::vec![(0u32, 0u32, 0u32); self.tets.len() * 4];
+        for (ti, tet) in self.tets.iter().enumerate() {
+            for (local, (idx, _)) in TET_FACES.into_iter().enumerate() {
+                let [a, b, c] = sorted_key(tet, idx);
+                let slot = &mut fill[a as usize];
+                slots[*slot as usize] = (b, c, 4 * ti as u32 + local as u32);
+                *slot += 1;
+            }
+        }
+
+        let mut out = Vec::new();
+        for v in 0..n {
+            let bucket = &mut slots[start[v] as usize..start[v + 1] as usize];
+            bucket.sort_unstable();
+            let mut i = 0;
+            while i < bucket.len() {
+                let (b, c, code) = bucket[i];
+                let mut j = i + 1;
+                while j < bucket.len() && bucket[j].0 == b && bucket[j].1 == c {
+                    j += 1;
+                }
+                if j - i == 1 {
+                    let tet = &self.tets[(code / 4) as usize];
+                    let (idx, apex) = TET_FACES[(code % 4) as usize];
+                    let tri = idx.map(|k| tet[k]);
+                    out.push((self.orient_outward(tri, tet[apex]), code));
+                }
+                i = j;
+            }
+        }
+        out
     }
 
     /// The boundary faces with their geometry: outward-wound vertex indices, area, and
@@ -259,7 +328,19 @@ impl TetMesh {
     #[cfg(feature = "bvh")]
     #[must_use]
     pub(crate) fn surface_cached(&self) -> &TriMesh {
-        self.cache.surface.get_or_init(|| self.surface())
+        &self.boundary_cached().mesh
+    }
+
+    /// The cached boundary surface with its face owners, extracted on first use.
+    #[cfg(feature = "bvh")]
+    pub(crate) fn boundary_cached(&self) -> &BoundarySurface {
+        self.cache.surface.get_or_init(|| {
+            let (faces, owners) = self.boundary_with_owners().into_iter().unzip();
+            BoundarySurface {
+                mesh: TriMesh::new(self.vertices.clone(), faces),
+                owners,
+            }
+        })
     }
 
     /// The cached [`TetBvh`](crate::accel::TetBvh) over the elements, built on first use.

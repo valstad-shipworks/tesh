@@ -45,7 +45,7 @@ pub(crate) struct Bvh2 {
 
 /// Half the surface area; relative SAH costs only need proportionality.
 #[inline]
-fn half_area(aabb: &Aabb) -> f32 {
+pub(crate) fn half_area(aabb: &Aabb) -> f32 {
     let e = aabb.extents().max(Vec3::ZERO);
     e.x * e.y + e.y * e.z + e.z * e.x
 }

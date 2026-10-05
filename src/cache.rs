@@ -64,7 +64,7 @@ pub(crate) struct TetCache {
     #[cfg(feature = "kdtree")]
     pub(crate) kdtree: Lazy<crate::accel::VertexKdTree>,
     #[cfg(feature = "bvh")]
-    pub(crate) surface: Lazy<crate::tri::TriMesh>,
+    pub(crate) surface: Lazy<crate::tet::BoundarySurface>,
     #[cfg(feature = "bvh")]
     pub(crate) tet_bvh: Lazy<crate::accel::TetBvh>,
 }

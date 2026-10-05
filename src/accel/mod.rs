@@ -7,6 +7,8 @@
 mod bvh;
 #[cfg(feature = "bvh")]
 mod bvh2;
+#[cfg(feature = "bvh")]
+mod bvh4;
 #[cfg(feature = "kdtree")]
 mod kdtree;
 #[cfg(feature = "bvh")]
