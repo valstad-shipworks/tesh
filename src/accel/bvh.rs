@@ -153,8 +153,18 @@ impl TriBvh {
         if self.bvh.nodes.is_empty() {
             return false;
         }
-        let crossings = dispatch(ParityQuery { tree: self, p });
-        crossings % 2 == 1
+        let mut inside = 0;
+        for (i, &dir) in PARITY_DIRS.iter().enumerate() {
+            let (crossings, ambiguous) = dispatch(ParityQuery { tree: self, p, dir });
+            if !ambiguous {
+                return crossings % 2 == 1;
+            }
+            inside += usize::from(crossings % 2 == 1);
+            if inside * 2 > PARITY_DIRS.len() || (i + 1 - inside) * 2 > PARITY_DIRS.len() {
+                break;
+            }
+        }
+        inside * 2 > PARITY_DIRS.len()
     }
 
     /// Signed distance to the surface: negative inside, positive outside.
@@ -206,6 +216,7 @@ fn ray_tri_wide<S: Backend<f32>>(
     v: [Varying<f32, S>; 9],
 ) -> (Varying<f32, S>, Mask<f32, S>) {
     const EPS: f32 = 1e-7;
+    use triangle::PARALLEL_COS;
     let a = Vec3Wide([v[0], v[1], v[2]]);
     let b = Vec3Wide([v[3], v[4], v[5]]);
     let c = Vec3Wide([v[6], v[7], v[8]]);
@@ -221,16 +232,57 @@ fn ray_tri_wide<S: Backend<f32>>(
     let w = dir.dot(qvec) * inv;
     let t = e2.dot(qvec) * inv;
 
+    let n = cross(e1, e2);
     let zero = g.splat(0.0);
     let one = g.splat(1.0);
     let eps = g.splat(EPS);
-    let valid = det.abs().ge(eps)
+    let valid = (det * det).gt(g.splat(PARALLEL_COS * PARALLEL_COS) * n.dot(n) * dir.dot(dir))
         & u.ge(zero)
         & u.le(one)
         & w.ge(zero)
         & (u + w).le(one)
         & t.ge(eps);
     (t.select(valid, g.splat(f32::INFINITY)), valid)
+}
+
+/// [`ray_tri_wide`]'s crossing test for a parity count: whether the ray crosses each lane's
+/// triangle, and whether it passes within [`EDGE_BAND`] of an edge of it, where rounding
+/// decides which of the triangles sharing that edge the crossing lands on.
+#[inline(always)]
+fn parity_tri_wide<S: Backend<f32>>(
+    g: Gang<S>,
+    origin: Vec3Wide<S>,
+    dir: Vec3Wide<S>,
+    v: [Varying<f32, S>; 9],
+) -> (Mask<f32, S>, Mask<f32, S>) {
+    const EPS: f32 = 1e-7;
+    use triangle::PARALLEL_COS;
+    let a = Vec3Wide([v[0], v[1], v[2]]);
+    let b = Vec3Wide([v[3], v[4], v[5]]);
+    let c = Vec3Wide([v[6], v[7], v[8]]);
+
+    let e1 = b - a;
+    let e2 = c - a;
+    let pvec = cross(dir, e2);
+    let det = e1.dot(pvec);
+    let inv = g.splat(1.0) / det;
+    let tvec = origin - a;
+    let u = tvec.dot(pvec) * inv;
+    let qvec = cross(tvec, e1);
+    let w = dir.dot(qvec) * inv;
+    let t = e2.dot(qvec) * inv;
+    let n = cross(e1, e2);
+
+    let zero = g.splat(0.0);
+    let one = g.splat(1.0);
+    let band = g.splat(EDGE_BAND);
+    let facing = (det * det).gt(g.splat(PARALLEL_COS * PARALLEL_COS) * n.dot(n));
+    let ahead = t.ge(g.splat(EPS));
+    let rest = one - u - w;
+    let valid = facing & ahead & u.ge(zero) & u.le(one) & w.ge(zero) & rest.ge(zero);
+    let near = u.ge(-band) & w.ge(-band) & rest.ge(-band);
+    let edge = u.lt(band) | w.lt(band) | rest.lt(band);
+    (valid, facing & ahead & near & edge)
 }
 
 /// Folds a chunk's per-lane `t` into the running best, resolving the winning lane in the
@@ -373,18 +425,32 @@ fn ray_leaf<S: Backend<f32>>(
     }
 }
 
+/// Ray directions for the parity test, tried in order until one gives an unambiguous count.
+/// None is axis-aligned or near another, so a ray that grazes an edge along one is unlikely
+/// to graze one along the next.
+const PARITY_DIRS: [Vec3; 3] = [
+    Vec3::new(0.573_1, 0.602_9, 0.555_2),
+    Vec3::new(-0.651_8, 0.270_4, 0.708_4),
+    Vec3::new(0.319_2, -0.811_5, 0.489_6),
+];
+
+/// A crossing this close to a triangle's edge, in barycentric terms, may be counted by both
+/// triangles that share the edge or by neither, so the count it is part of is not trusted.
+const EDGE_BAND: f32 = 1e-3;
+
 struct ParityQuery<'a> {
     tree: &'a TriBvh,
     p: Vec3,
+    dir: Vec3,
 }
 
 impl Kernel<f32> for ParityQuery<'_> {
-    /// Number of ray crossings.
-    type Output = u32;
+    /// Number of ray crossings, and whether any of them grazed an edge.
+    type Output = (u32, bool);
 
-    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> u32 {
+    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> (u32, bool) {
         let nodes = &self.tree.bvh.nodes;
-        let dir = Vec3::new(0.573_1, 0.602_9, 0.555_2).normalize();
+        let dir = self.dir.normalize();
         let origin_a = Vec3A::from(self.p);
         let inv_dir = Vec3A::from(dir).recip();
         let ow = g.splat_vec3(self.p);
@@ -392,9 +458,10 @@ impl Kernel<f32> for ParityQuery<'_> {
         let lanes = g.lanes::<f32>();
 
         if ray_aabb(&nodes[0], origin_a, inv_dir, f32::INFINITY).is_infinite() {
-            return 0;
+            return (0, false);
         }
         let mut crossings = 0u32;
+        let mut ambiguous = false;
         let mut stack: TraversalStack<u32> = TraversalStack::new();
         let mut ni = 0u32;
         loop {
@@ -405,9 +472,10 @@ impl Kernel<f32> for ParityQuery<'_> {
                 let cols = self.tree.leaf_cols(start, len, lanes);
                 for off in (0..cols[0].len()).step_by(lanes) {
                     let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
-                    let (_, valid) = ray_tri_wide(g, ow, dw, v);
+                    let (valid, grazed) = parity_tri_wide(g, ow, dw, v);
                     let active = g.active_mask::<f32>((len - off).min(lanes));
                     crossings += (valid & active).to_bitmask().count_ones();
+                    ambiguous |= (grazed & active).to_bitmask() != 0;
                 }
             } else {
                 let l = node.first;
@@ -429,7 +497,7 @@ impl Kernel<f32> for ParityQuery<'_> {
             }
             match stack.pop() {
                 Some(n) => ni = n,
-                None => return crossings,
+                None => return (crossings, ambiguous),
             }
         }
     }
