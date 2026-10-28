@@ -118,6 +118,12 @@ pub fn distance_squared(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
     (p - closest_point(p, a, b, c)).length_squared()
 }
 
+/// The ray counts as parallel to a triangle, and misses it, when the cosine between the ray
+/// and the triangle's plane normal is below this. The determinant scales with the triangle's
+/// area, so it is compared against the area: a fixed threshold on it would drop real crossings
+/// of thin triangles, and a dropped crossing flips a parity count.
+pub(crate) const PARALLEL_COS: f32 = 1e-6;
+
 /// Ray parameter `t` of the intersection of `origin + t * dir` with triangle `abc`
 /// (Möller–Trumbore), or `None` for a miss, a ray parallel to the plane, or `t` below a
 /// small epsilon (so an origin on the surface does not hit its own triangle).
@@ -128,7 +134,9 @@ pub fn ray_intersect(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Opti
     let e2 = c - a;
     let pvec = dir.cross(e2);
     let det = e1.dot(pvec);
-    if det.abs() < EPS {
+    let parallel =
+        PARALLEL_COS * PARALLEL_COS * e1.cross(e2).length_squared() * dir.length_squared();
+    if det * det <= parallel {
         return None;
     }
     let inv = 1.0 / det;
