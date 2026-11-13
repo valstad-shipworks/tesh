@@ -1,6 +1,6 @@
 [package]
 name = "tesh"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Bowan Foryt <bowan@valstad.com>"]
@@ -11,7 +11,8 @@ repository = "https://github.com/valstad-shipworks/tesh"
 approx = { version = "0.5.1", default-features = false, optional = true }
 bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
 glam = { version = "0.32", default-features = false }
-hydroplane = { version = "0.1.0", default-features = false, features = ["glam"] }
+hydroplane = { version = "0.2.1", default-features = false, features = ["glam"], path = "../hydroplane" }
+hydroplane-solvers = { version = "0.2.0", path = "../hydroplane/hydroplane-solvers", optional = true }
 kiddo = { version = "5.3.2", optional = true }
 libm = { version = "0.2.16", optional = true }
 serde = { version = "1.0.228", default-features = false, features = ["derive"], optional = true }
@@ -24,7 +25,7 @@ default = ["std", "kdtree", "bvh"]
 std = ["glam/std", "hydroplane/std", "serde?/std", "approx?/std"]
 libm = ["dep:libm", "glam/libm", "hydroplane/libm", "hydroplane/alloc"]
 kdtree = ["dep:kiddo", "std"]
-bvh = ["std"]
+bvh = ["std", "dep:hydroplane-solvers"]
 serde = ["dep:serde", "serde/alloc", "glam/serde"]
 bytemuck = ["dep:bytemuck", "glam/bytemuck"]
 approx = ["dep:approx", "glam/approx"]

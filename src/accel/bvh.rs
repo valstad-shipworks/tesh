@@ -1,21 +1,18 @@
 use alloc::vec::Vec;
 use core::array;
+use core::ops::Range;
 
-use glam::{Vec3, Vec3A};
-use hydroplane::{
-    Backend, BackendAll, Gang, GangGlamExt, Kernel, Mask, Varying, Vec3Wide, dispatch,
-};
+use glam::Vec3;
+use hydroplane::{Backend, BackendAll, Gang, GangGlamExt, Mask, Varying, Vec3Wide};
+use hydroplane_solvers::bvh::{Bvh, NearestLeaves, Options, RayLeaves};
 
-use crate::aabb::Aabb;
-use crate::accel::TraversalStack;
-use crate::accel::bvh2::{Bvh2, Node};
-use crate::accel::bvh4::{self, Node4, Ray4, SLAB_EXIT_SCALE};
+use crate::accel::prim_bounds;
 use crate::tri::{RayHit, TriMesh};
 use crate::triangle;
 
 /// Wide leaves: every triangle in a leaf is tested in one SPMD pass, so the tree trades
 /// depth for SIMD-friendly leaf width.
-const MAX_LEAF: u32 = 16;
+const MAX_LEAF: usize = hydroplane_solvers::bvh::DEFAULT_MAX_LEAF;
 
 /// Slots of padding past the last triangle, so a leaf whose length is not a whole number of
 /// registers can still finish on a full-width load instead of a staged partial one.
@@ -23,7 +20,7 @@ const MAX_LEAF: u32 = 16;
 /// Every lane a leaf's walk loads therefore still holds a real face of this mesh: the lanes past
 /// a leaf read the next leaf's triangles, and past the last leaf the padding repeats the final
 /// triangle. Ranking one of those early is harmless — the traversal only ever prunes on hits it
-/// was entitled to find — so only [`ParityQuery`], which counts crossings rather than ranking
+/// was entitled to find — so only [`ParityLeaf`], which counts crossings rather than ranking
 /// them, has to mask the lanes past its leaf back out.
 const COLUMN_PAD: usize = hydroplane::MAX_LANES;
 
@@ -32,23 +29,11 @@ const COLUMN_PAD: usize = hydroplane::MAX_LANES;
 /// Build it once from a [`TriMesh`]; queries reuse the tree. Face indices in results refer
 /// to the mesh the tree was built from.
 pub struct TriBvh {
-    bvh: Bvh2,
-    /// The same tree collapsed to 4-wide nodes, for ray traversal.
-    nodes4: Vec<Node4>,
+    /// Nodes as wide as the SIMD registers of the machine it was built on.
+    bvh: Bvh,
     /// Corner components in leaf-slot order, one column per `(corner, axis)`:
     /// `ax ay az bx by bz cx cy cz`. Slot order keeps each leaf's lanes contiguous.
     corners: [Vec<f32>; 9],
-}
-
-/// `t` at which the ray enters the node's bounds, or `INFINITY` when it misses or enters
-/// past `tmax`.
-#[inline]
-fn ray_aabb(node: &Node, origin: Vec3A, inv_dir: Vec3A, tmax: f32) -> f32 {
-    let t1 = (node.min - origin) * inv_dir;
-    let t2 = (node.max - origin) * inv_dir;
-    let t_near = t1.min(t2).max_element().max(0.0);
-    let t_far = (t1.max(t2).min_element() * SLAB_EXIT_SCALE).min(tmax);
-    if t_near <= t_far { t_near } else { f32::INFINITY }
 }
 
 impl TriBvh {
@@ -56,20 +41,16 @@ impl TriBvh {
     #[must_use]
     pub fn new(mesh: &TriMesh) -> Self {
         let tris: Vec<[Vec3; 3]> = mesh.triangles().collect();
-        let aabbs: Vec<Aabb> = tris
-            .iter()
-            .map(|&[a, b, c]| {
-                let mut aabb = Aabb::from_point(a);
-                aabb.expand(b);
-                aabb.expand(c);
-                aabb
-            })
-            .collect();
-        let bvh = Bvh2::build(&aabbs, MAX_LEAF);
+        let boxes: Vec<_> = tris.iter().map(prim_bounds).collect();
+        let options = Options {
+            max_leaf: Some(MAX_LEAF),
+            ..Options::default()
+        };
+        let bvh = Bvh::with_options(&boxes, options);
 
         let mut corners: [Vec<f32>; 9] =
             array::from_fn(|_| Vec::with_capacity(tris.len() + COLUMN_PAD));
-        for &pi in &bvh.prim_indices {
+        for &pi in bvh.order() {
             for (k, v) in tris[pi as usize].iter().enumerate() {
                 corners[3 * k].push(v.x);
                 corners[3 * k + 1].push(v.y);
@@ -80,12 +61,7 @@ impl TriBvh {
             let last = col.last().copied().unwrap_or(0.0);
             col.resize(col.len() + COLUMN_PAD, last);
         }
-        let nodes4 = bvh4::collapse(&bvh);
-        Self {
-            bvh,
-            nodes4,
-            corners,
-        }
+        Self { bvh, corners }
     }
 
     /// The triangle behind BVH primitive slot `slot`.
@@ -102,23 +78,17 @@ impl TriBvh {
     /// Nearest intersection of the ray `origin + t * dir` (`t >= 0`) with the surface.
     #[must_use]
     pub fn ray_intersect(&self, origin: Vec3, dir: Vec3) -> Option<RayHit> {
-        let inv_dir = bvh4::safe_inv_dir(dir);
-        if !self
-            .bvh
-            .nodes
-            .first()
-            .is_some_and(|root| bvh4::hits_node(root, origin, inv_dir))
-        {
-            return None;
-        }
-        dispatch(RayQuery {
+        let mut leaves = RayLeaf {
             tree: self,
             origin,
             dir,
-            inv_dir,
-        })
-        .map(|(slot, t)| RayHit {
-            face: self.bvh.prim_indices[slot],
+            slot: usize::MAX,
+        };
+        let t = self
+            .bvh
+            .ray(origin.to_array(), dir.to_array(), f32::INFINITY, &mut leaves)?;
+        Some(RayHit {
+            face: self.bvh.order()[leaves.slot],
             t,
             point: origin + dir * t,
         })
@@ -133,10 +103,7 @@ impl TriBvh {
     /// The face holding the point closest to `p`, or `None` for an empty mesh.
     #[must_use]
     pub fn closest_face(&self, p: Vec3) -> Option<u32> {
-        if self.bvh.nodes.is_empty() {
-            return None;
-        }
-        dispatch(ClosestQuery { tree: self, p }).map(|slot| self.bvh.prim_indices[slot])
+        self.closest_slot(p).map(|slot| self.bvh.order()[slot])
     }
 
     /// Unsigned distance from `p` to the surface.
@@ -150,16 +117,24 @@ impl TriBvh {
     /// single traversal (parity). Robust for watertight, consistently wound meshes.
     #[must_use]
     pub fn contains_point(&self, p: Vec3) -> bool {
-        if self.bvh.nodes.is_empty() {
+        if self.bvh.is_empty() {
             return false;
         }
         let mut inside = 0;
         for (i, &dir) in PARITY_DIRS.iter().enumerate() {
-            let (crossings, ambiguous) = dispatch(ParityQuery { tree: self, p, dir });
-            if !ambiguous {
-                return crossings % 2 == 1;
+            let mut leaves = ParityLeaf {
+                tree: self,
+                origin: p,
+                dir: dir.normalize(),
+                crossings: 0,
+                ambiguous: false,
+            };
+            self.bvh
+                .ray(p.to_array(), leaves.dir.to_array(), f32::INFINITY, &mut leaves);
+            if !leaves.ambiguous {
+                return leaves.crossings % 2 == 1;
             }
-            inside += usize::from(crossings % 2 == 1);
+            inside += usize::from(leaves.crossings % 2 == 1);
             if inside * 2 > PARITY_DIRS.len() || (i + 1 - inside) * 2 > PARITY_DIRS.len() {
                 break;
             }
@@ -176,10 +151,7 @@ impl TriBvh {
 
     /// `(squared_distance, closest_point)` — the shared core of the distance queries.
     fn closest(&self, p: Vec3) -> (f32, Vec3) {
-        if self.bvh.nodes.is_empty() {
-            return (f32::INFINITY, p);
-        }
-        match dispatch(ClosestQuery { tree: self, p }) {
+        match self.closest_slot(p) {
             // The wide pass only ranks lanes; the winning triangle is re-solved exactly.
             Some(slot) => {
                 let [a, b, c] = self.tri_at(slot);
@@ -190,12 +162,23 @@ impl TriBvh {
         }
     }
 
+    /// Slot of the triangle closest to `p`.
+    fn closest_slot(&self, p: Vec3) -> Option<usize> {
+        let mut leaves = NearestLeaf {
+            tree: self,
+            p,
+            slot: usize::MAX,
+        };
+        self.bvh.nearest(p.to_array(), f32::INFINITY, &mut leaves)?;
+        Some(leaves.slot)
+    }
+
     /// A leaf's corner columns, extended to a whole number of `lanes`-wide registers so every
     /// chunk of the walk is a full load. Safe to over-read by [`COLUMN_PAD`]'s contract.
-    #[inline]
-    fn leaf_cols(&self, start: usize, len: usize, lanes: usize) -> [&[f32]; 9] {
-        let end = start + len.next_multiple_of(lanes);
-        array::from_fn(|k| &self.corners[k][start..end])
+    #[inline(always)]
+    fn leaf_cols(&self, slots: &Range<usize>, lanes: usize) -> [&[f32]; 9] {
+        let end = slots.start + slots.len().next_multiple_of(lanes);
+        array::from_fn(|k| &self.corners[k][slots.start..end])
     }
 }
 
@@ -305,123 +288,54 @@ fn take_nearest<S: Backend<f32>>(
     }
 }
 
-struct RayQuery<'a> {
+/// Nearest-hit leaf test for [`TriBvh::ray_intersect`]; `slot` ends on the winning triangle.
+struct RayLeaf<'a> {
     tree: &'a TriBvh,
     origin: Vec3,
     dir: Vec3,
-    inv_dir: Vec3,
+    slot: usize,
 }
 
-impl Kernel<f32> for RayQuery<'_> {
-    /// `(slot, t)` of the nearest hit.
-    type Output = Option<(usize, f32)>;
-
-    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> Self::Output {
-        let nodes = &self.tree.nodes4;
-        let ray = Ray4::new(self.origin, self.inv_dir);
-        let ow = g.splat_vec3(self.origin);
-        let dw = g.splat_vec3(self.dir);
-
-        let mut best_t = f32::INFINITY;
-        let mut best_slot = usize::MAX;
-        let mut stack: TraversalStack<(u32, f32)> = TraversalStack::new();
-        let mut ni = 0u32;
-        loop {
-            let node = &nodes[ni as usize];
-            let t = ray.hit_children(node, best_t);
-
-            // Hit children as (child, count, entry t), nearest first.
-            let mut order = [(0u32, 0u32, 0.0f32); 4];
-            let mut hits = 0;
-            for (lane, &entry) in t.iter().enumerate() {
-                if entry < best_t {
-                    let mut p = hits;
-                    while p > 0 && order[p - 1].2 > entry {
-                        order[p] = order[p - 1];
-                        p -= 1;
-                    }
-                    order[p] = (node.child[lane], node.count[lane], entry);
-                    hits += 1;
-                }
-            }
-
-            // Leaves first, nearest first: each hit tightens `best_t` for every box after it.
-            for &(first, count, entry) in &order[..hits] {
-                if count > 0 && entry < best_t {
-                    let (start, len) = (first as usize, count as usize);
-                    ray_leaf(g, self.tree, ow, dw, start, len, &mut best_t, &mut best_slot);
-                }
-            }
-
-            // Descend into the nearest internal child, deferring the rest farthest-first.
-            let mut next = None;
-            for &(child, count, entry) in order[..hits].iter().rev() {
-                if count == 0
-                    && entry < best_t
-                    && let Some(deferred) = next.replace((child, entry))
-                {
-                    stack.push(deferred);
-                }
-            }
-            if let Some((child, _)) = next {
-                ni = child;
-                continue;
-            }
-            loop {
-                match stack.pop() {
-                    Some((child, entry)) if entry < best_t => {
-                        ni = child;
-                        break;
-                    }
-                    Some(_) => {}
-                    None => return (best_slot != usize::MAX).then_some((best_slot, best_t)),
-                }
-            }
+impl RayLeaves for RayLeaf<'_> {
+    /// The chunk minima are combined lane-wise and reduced once per leaf, keeping the
+    /// horizontal reduction off the per-chunk critical path; the winning lane is recovered only
+    /// when the leaf improves on `t_max`.
+    #[inline(always)]
+    fn hit<S: BackendAll + Backend<f32>>(
+        &mut self,
+        g: Gang<S>,
+        slots: Range<usize>,
+        t_max: f32,
+    ) -> Option<f32> {
+        let lanes = g.lanes::<f32>();
+        let cols = self.tree.leaf_cols(&slots, lanes);
+        let chunks = cols[0].len() / lanes;
+        let origin = g.splat_vec3(self.origin);
+        let dir = g.splat_vec3(self.dir);
+        let inf = g.splat(f32::INFINITY);
+        let mut chunk_t = [inf; MAX_LEAF];
+        let mut leaf_min = inf;
+        for (ci, slot) in chunk_t.iter_mut().enumerate().take(chunks) {
+            let off = ci * lanes;
+            let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
+            let (t, _) = ray_tri_wide(g, origin, dir, v);
+            *slot = t;
+            leaf_min = leaf_min.min(t);
         }
-    }
-}
-
-/// Tests one leaf's triangles and folds the nearest into the running best. The chunk minima
-/// are combined lane-wise and reduced once per leaf, keeping the horizontal reduction off the
-/// per-chunk critical path; the winning lane is recovered only when the leaf improves on
-/// `best_t`.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn ray_leaf<S: Backend<f32>>(
-    g: Gang<S>,
-    tree: &TriBvh,
-    origin: Vec3Wide<S>,
-    dir: Vec3Wide<S>,
-    start: usize,
-    len: usize,
-    best_t: &mut f32,
-    best_slot: &mut usize,
-) {
-    let lanes = g.lanes::<f32>();
-    let cols = tree.leaf_cols(start, len, lanes);
-    let chunks = cols[0].len() / lanes;
-    let inf = g.splat(f32::INFINITY);
-    let mut chunk_t = [inf; MAX_LEAF as usize];
-    let mut leaf_min = inf;
-    for (ci, slot) in chunk_t.iter_mut().enumerate().take(chunks) {
-        let off = ci * lanes;
-        let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
-        let (t, _) = ray_tri_wide(g, origin, dir, v);
-        *slot = t;
-        leaf_min = leaf_min.min(t);
-    }
-    let leaf_t = leaf_min.reduce_min();
-    if leaf_t < *best_t {
-        *best_t = leaf_t;
+        let leaf_t = leaf_min.reduce_min();
+        if leaf_t >= t_max {
+            return None;
+        }
         let m = g.splat(leaf_t);
         // The first chunk holding the minimum, lowest lane on a tie, as a forward scan would.
         for (ci, t) in chunk_t[..chunks].iter().enumerate() {
             let bits = t.le(m).to_bitmask();
             if bits != 0 {
-                *best_slot = start + ci * lanes + bits.trailing_zeros() as usize;
+                self.slot = slots.start + ci * lanes + bits.trailing_zeros() as usize;
                 break;
             }
         }
+        Some(leaf_t)
     }
 }
 
@@ -438,68 +352,37 @@ const PARITY_DIRS: [Vec3; 3] = [
 /// triangles that share the edge or by neither, so the count it is part of is not trusted.
 const EDGE_BAND: f32 = 1e-3;
 
-struct ParityQuery<'a> {
+/// Crossing counter for [`TriBvh::contains_point`]: it never reports a hit, so the traversal
+/// visits every leaf the ray enters.
+struct ParityLeaf<'a> {
     tree: &'a TriBvh,
-    p: Vec3,
+    origin: Vec3,
     dir: Vec3,
+    crossings: u32,
+    /// Whether any crossing grazed an edge.
+    ambiguous: bool,
 }
 
-impl Kernel<f32> for ParityQuery<'_> {
-    /// Number of ray crossings, and whether any of them grazed an edge.
-    type Output = (u32, bool);
-
-    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> (u32, bool) {
-        let nodes = &self.tree.bvh.nodes;
-        let dir = self.dir.normalize();
-        let origin_a = Vec3A::from(self.p);
-        let inv_dir = Vec3A::from(dir).recip();
-        let ow = g.splat_vec3(self.p);
-        let dw = g.splat_vec3(dir);
+impl RayLeaves for ParityLeaf<'_> {
+    #[inline(always)]
+    fn hit<S: BackendAll + Backend<f32>>(
+        &mut self,
+        g: Gang<S>,
+        slots: Range<usize>,
+        _: f32,
+    ) -> Option<f32> {
         let lanes = g.lanes::<f32>();
-
-        if ray_aabb(&nodes[0], origin_a, inv_dir, f32::INFINITY).is_infinite() {
-            return (0, false);
+        let cols = self.tree.leaf_cols(&slots, lanes);
+        let origin = g.splat_vec3(self.origin);
+        let dir = g.splat_vec3(self.dir);
+        for off in (0..cols[0].len()).step_by(lanes) {
+            let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
+            let (valid, grazed) = parity_tri_wide(g, origin, dir, v);
+            let active = g.active_mask::<f32>((slots.len() - off).min(lanes));
+            self.crossings += (valid & active).to_bitmask().count_ones();
+            self.ambiguous |= (grazed & active).to_bitmask() != 0;
         }
-        let mut crossings = 0u32;
-        let mut ambiguous = false;
-        let mut stack: TraversalStack<u32> = TraversalStack::new();
-        let mut ni = 0u32;
-        loop {
-            let node = &nodes[ni as usize];
-            if node.is_leaf() {
-                let start = node.first as usize;
-                let len = node.count as usize;
-                let cols = self.tree.leaf_cols(start, len, lanes);
-                for off in (0..cols[0].len()).step_by(lanes) {
-                    let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
-                    let (valid, grazed) = parity_tri_wide(g, ow, dw, v);
-                    let active = g.active_mask::<f32>((len - off).min(lanes));
-                    crossings += (valid & active).to_bitmask().count_ones();
-                    ambiguous |= (grazed & active).to_bitmask() != 0;
-                }
-            } else {
-                let l = node.first;
-                let hit_l =
-                    ray_aabb(&nodes[l as usize], origin_a, inv_dir, f32::INFINITY).is_finite();
-                let hit_r =
-                    ray_aabb(&nodes[l as usize + 1], origin_a, inv_dir, f32::INFINITY).is_finite();
-                if hit_l {
-                    if hit_r {
-                        stack.push(l + 1);
-                    }
-                    ni = l;
-                    continue;
-                }
-                if hit_r {
-                    ni = l + 1;
-                    continue;
-                }
-            }
-            match stack.pop() {
-                Some(n) => ni = n,
-                None => return (crossings, ambiguous),
-            }
-        }
+        None
     }
 }
 
@@ -564,59 +447,30 @@ fn dist2_tri_wide<S: Backend<f32>>(
     (p - q).length_squared()
 }
 
-struct ClosestQuery<'a> {
+/// Closest-triangle leaf test for [`TriBvh::closest_point`]; `slot` ends on the winner.
+struct NearestLeaf<'a> {
     tree: &'a TriBvh,
     p: Vec3,
+    slot: usize,
 }
 
-impl Kernel<f32> for ClosestQuery<'_> {
-    /// Slot of the closest triangle.
-    type Output = Option<usize>;
-
-    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> Self::Output {
-        let nodes = &self.tree.bvh.nodes;
-        let pa = Vec3A::from(self.p);
-        let pw = g.splat_vec3(self.p);
+impl NearestLeaves for NearestLeaf<'_> {
+    #[inline(always)]
+    fn nearest<S: BackendAll + Backend<f32>>(
+        &mut self,
+        g: Gang<S>,
+        slots: Range<usize>,
+        best_d2: f32,
+    ) -> Option<f32> {
         let lanes = g.lanes::<f32>();
-
-        let mut best_d2 = f32::INFINITY;
-        let mut best_slot = usize::MAX;
-        let mut stack: TraversalStack<(u32, f32)> = TraversalStack::new();
-        let mut ni = 0u32;
-        'traverse: loop {
-            let node = &nodes[ni as usize];
-            if node.is_leaf() {
-                let start = node.first as usize;
-                let len = node.count as usize;
-                let cols = self.tree.leaf_cols(start, len, lanes);
-                for off in (0..cols[0].len()).step_by(lanes) {
-                    let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
-                    let d2 = dist2_tri_wide(g, pw, v);
-                    take_nearest(g, d2, start + off, &mut best_d2, &mut best_slot);
-                }
-            } else {
-                let l = node.first;
-                let dl = nodes[l as usize].distance_squared(pa);
-                let dr = nodes[l as usize + 1].distance_squared(pa);
-                // Descend into the nearer child, deferring the farther one.
-                let (near, far) = if dl <= dr { (l, l + 1) } else { (l + 1, l) };
-                let (d_near, d_far) = if dl <= dr { (dl, dr) } else { (dr, dl) };
-                if d_near < best_d2 {
-                    if d_far < best_d2 {
-                        stack.push((far, d_far));
-                    }
-                    ni = near;
-                    continue;
-                }
-            }
-            while let Some((n, d)) = stack.pop() {
-                if d < best_d2 {
-                    ni = n;
-                    continue 'traverse;
-                }
-            }
-            break;
+        let cols = self.tree.leaf_cols(&slots, lanes);
+        let p = g.splat_vec3(self.p);
+        let mut best = best_d2;
+        for off in (0..cols[0].len()).step_by(lanes) {
+            let v = array::from_fn(|k| g.load(&cols[k][off..off + lanes]));
+            let d2 = dist2_tri_wide(g, p, v);
+            take_nearest(g, d2, slots.start + off, &mut best, &mut self.slot);
         }
-        (best_slot != usize::MAX).then_some(best_slot)
+        (best < best_d2).then_some(best)
     }
 }

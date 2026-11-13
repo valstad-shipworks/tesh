@@ -1,21 +1,21 @@
 use alloc::vec::Vec;
 use core::array;
+use core::ops::{ControlFlow, Range};
 
-use glam::{Vec3, Vec3A};
-use hydroplane::{Backend, BackendAll, Gang, GangGlamExt, Kernel, Varying, Vec3Wide, dispatch};
+use glam::Vec3;
+use hydroplane::{Backend, BackendAll, Gang, GangGlamExt, Varying, Vec3Wide};
+use hydroplane_solvers::bvh::{Bvh, Options, OverlapLeaves};
 
-use crate::aabb::Aabb;
-use crate::accel::TraversalStack;
-use crate::accel::bvh2::Bvh2;
+use crate::accel::prim_bounds;
 use crate::tet::TetMesh;
 
 /// Wide leaves: every tetrahedron in a leaf is containment-tested in one SPMD pass, so the
 /// tree trades depth for SIMD-friendly leaf width.
-const MAX_LEAF: u32 = 16;
+const MAX_LEAF: usize = hydroplane_solvers::bvh::DEFAULT_MAX_LEAF;
 
 /// A BVH over a tetrahedral mesh's element bounding boxes, for accelerated point location.
 pub struct TetBvh {
-    bvh: Bvh2,
+    bvh: Bvh,
     /// Corner components in leaf-slot order, one column per `(corner, axis)`:
     /// `ax ay az bx by bz cx cy cz dx dy dz`. Slot order keeps each leaf's lanes contiguous.
     corners: [Vec<f32>; 12],
@@ -26,20 +26,15 @@ impl TetBvh {
     #[must_use]
     pub fn new(mesh: &TetMesh) -> Self {
         let tets: Vec<[Vec3; 4]> = mesh.tetrahedra().collect();
-        let aabbs: Vec<Aabb> = tets
-            .iter()
-            .map(|&[a, b, c, d]| {
-                let mut aabb = Aabb::from_point(a);
-                aabb.expand(b);
-                aabb.expand(c);
-                aabb.expand(d);
-                aabb
-            })
-            .collect();
-        let bvh = Bvh2::build(&aabbs, MAX_LEAF);
+        let boxes: Vec<_> = tets.iter().map(prim_bounds).collect();
+        let options = Options {
+            max_leaf: Some(MAX_LEAF),
+            ..Options::default()
+        };
+        let bvh = Bvh::with_options(&boxes, options);
 
         let mut corners: [Vec<f32>; 12] = array::from_fn(|_| Vec::with_capacity(tets.len()));
-        for &pi in &bvh.prim_indices {
+        for &pi in bvh.order() {
             for (k, v) in tets[pi as usize].iter().enumerate() {
                 corners[3 * k].push(v.x);
                 corners[3 * k + 1].push(v.y);
@@ -52,64 +47,45 @@ impl TetBvh {
     /// Index of a tetrahedron containing `p`, or `None` if `p` is outside the volume.
     #[must_use]
     pub fn find_containing_tet(&self, p: Vec3) -> Option<usize> {
-        if self.bvh.nodes.is_empty() {
-            return None;
-        }
-        dispatch(Locate { tree: self, p }).map(|slot| self.bvh.prim_indices[slot] as usize)
+        let mut leaves = Locate {
+            tree: self,
+            p,
+            found: None,
+        };
+        let _ = self.bvh.containing(p.to_array(), &mut leaves);
+        leaves.found.map(|slot| self.bvh.order()[slot] as usize)
     }
 }
 
+/// Stops the descent at the first leaf holding a tetrahedron that contains `p`.
 struct Locate<'a> {
     tree: &'a TetBvh,
     p: Vec3,
+    /// Slot of the containing tetrahedron.
+    found: Option<usize>,
 }
 
-impl Kernel<f32> for Locate<'_> {
-    /// Slot index of a containing tetrahedron.
-    type Output = Option<usize>;
-
-    fn run<S: BackendAll + Backend<f32>>(self, g: Gang<S>) -> Option<usize> {
-        let nodes = &self.tree.bvh.nodes;
-        let pa = Vec3A::from(self.p);
-        let pw = g.splat_vec3(self.p);
-
-        if !nodes[0].contains(pa) {
-            return None;
-        }
-        let mut stack: TraversalStack<u32> = TraversalStack::new();
-        let mut ni = 0u32;
-        loop {
-            let node = &nodes[ni as usize];
-            if node.is_leaf() {
-                let start = node.first as usize;
-                let end = start + node.count as usize;
-                let cols: [&[f32]; 12] = array::from_fn(|k| &self.tree.corners[k][start..end]);
-                let mut found = None;
-                g.for_each_hit_n(
-                    cols,
-                    |v| tet_contains_wide(g, pw, v),
-                    |i| found = found.or(Some(start + i)),
-                );
-                if found.is_some() {
-                    return found;
-                }
-            } else {
-                let l = node.first;
-                let in_l = nodes[l as usize].contains(pa);
-                let in_r = nodes[l as usize + 1].contains(pa);
-                if in_l {
-                    if in_r {
-                        stack.push(l + 1);
-                    }
-                    ni = l;
-                    continue;
-                }
-                if in_r {
-                    ni = l + 1;
-                    continue;
-                }
-            }
-            ni = stack.pop()?;
+impl OverlapLeaves for Locate<'_> {
+    #[inline(always)]
+    fn visit<S: BackendAll + Backend<f32>>(
+        &mut self,
+        g: Gang<S>,
+        slots: Range<usize>,
+    ) -> ControlFlow<()> {
+        let p = g.splat_vec3(self.p);
+        let start = slots.start;
+        let cols: [&[f32]; 12] = array::from_fn(|k| &self.tree.corners[k][slots.clone()]);
+        let mut found = None;
+        g.for_each_hit_n(
+            cols,
+            |v| tet_contains_wide(g, p, v),
+            |i| found = found.or(Some(start + i)),
+        );
+        self.found = found;
+        if found.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 }
